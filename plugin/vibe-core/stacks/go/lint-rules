@@ -1,0 +1,17 @@
+
+# ── go ───────────────────────────────────────────────────────────────────────
+
+rule: no-sleep-in-tests
+files: **/*_test.go
+pattern: \btime\.Sleep\(
+message: sleeping tests are slow and flaky; wait on a channel/condition or inject a fake clock
+bad: 	time.Sleep(100 * time.Millisecond)
+ok: 	<-done
+
+rule: no-todo-panic
+files: **/*.go
+pattern: panic\("(?i:todo|not implemented)
+message: placeholder panic; implement it or return an error
+bad: 	panic("TODO")
+bad: 	panic("not implemented")
+ok: 	panic(fmt.Sprintf("invariant violated: %v", x))

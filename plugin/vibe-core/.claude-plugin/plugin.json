@@ -1,0 +1,6 @@
+{
+  "name": "vibe-core",
+  "version": "0.1.0",
+  "description": "Progressive agent-ready setup for any repo: verify loop, lint rules, hooks, skills",
+  "author": { "name": "Ray" }
+}

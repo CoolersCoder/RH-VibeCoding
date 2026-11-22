@@ -1,0 +1,25 @@
+
+# ── python ───────────────────────────────────────────────────────────────────
+
+rule: no-breakpoint
+files: **/*.py
+pattern: \b(breakpoint\(\)|i?pdb\.set_trace\(\))
+message: leftover debugger call; remove it
+bad: breakpoint()
+bad:     import pdb; pdb.set_trace()
+ok: # step through with the IDE debugger instead
+
+rule: no-bare-except
+files: **/*.py
+pattern: ^\s*except\s*:
+message: bare except also swallows KeyboardInterrupt/SystemExit and hides bugs; catch the specific exception
+bad:     except:
+ok:     except ValueError:
+
+rule: no-print-in-app
+files: **/*.py
+exclude: tests/** **/tests/** **/test_*.py **/*_test.py scripts/** **/__main__.py **/cli.py **/conftest.py
+pattern: ^\s*print\(
+message: print in application code; use logging (delete this rule if the project is a CLI)
+bad:     print("debug", x)
+ok:     logger.debug("x=%s", x)

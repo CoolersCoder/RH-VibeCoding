@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(vibe verify:*)",
+      "Bash(vibe lint:*)",
+      "Bash(vibe doctor:*)",
+      "Bash(vibe state:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./**/.env)",
+      "Read(./**/.env.*)",
+      "Read(./**/*.pem)",
+      "Read(./**/*.key)",
+      "Read(./**/secrets/**)",
+      "Read(./**/node_modules/**)",
+      "Read(./**/dist/**)",
+      "Read(./**/build/**)",
+      "Read(./**/.next/**)",
+      "Read(./**/target/**)",
+      "Read(./**/DerivedData/**)",
+      "Read(./**/vendor/**)"
+    ]
+  }
+}

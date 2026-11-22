@@ -1,0 +1,24 @@
+
+# ── rust ─────────────────────────────────────────────────────────────────────
+
+rule: no-dbg
+files: **/*.rs
+pattern: \bdbg!\(
+message: leftover dbg!; remove it or use tracing/log
+bad:     dbg!(&config);
+ok:     tracing::debug!(?config);
+
+rule: no-todo-macro
+files: **/*.rs
+pattern: \b(todo|unimplemented)!\(
+message: placeholder macro panics at runtime; implement it or return an error
+bad:     todo!()
+ok:     // todo: handle the v2 format later
+
+rule: no-unwrap-in-lib
+files: src/**/*.rs
+exclude: src/bin/** src/**/tests.rs src/**/tests/**
+pattern: \.unwrap\(\)
+message: unwrap in library code; propagate with `?` or use `.expect("why this cannot fail")` (tests: mark the line lint:allow or move tests to tests/)
+bad:     let v = map.get(k).unwrap();
+ok:     let v = map.get(k).expect("key inserted above");

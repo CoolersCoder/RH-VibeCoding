@@ -1,0 +1,16 @@
+
+# ── jvm ──────────────────────────────────────────────────────────────────────
+
+rule: no-print-stack-trace
+files: **/*.{java,kt}
+pattern: \.printStackTrace\(\)
+message: printStackTrace bypasses logging; log the exception with the project's logger
+bad:         e.printStackTrace()
+ok:         log.error("sync failed", e)
+
+rule: no-system-out
+files: **/src/main/**/*.{java,kt}
+pattern: \bSystem\.(out|err)\.print
+message: System.out in production code; use the logger
+bad:         System.out.println("debug " + x);
+ok:         log.debug("debug {}", x);

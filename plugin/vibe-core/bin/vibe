@@ -1,0 +1,544 @@
+#!/usr/bin/env bash
+# vibe — progressive agent-ready setup for any repo. See `vibe help`.
+set -u
+
+resolve_self() {
+    local p="$1" d
+    while [ -L "$p" ]; do
+        d="$(cd "$(dirname "$p")" && pwd)"
+        p="$(readlink "$p")"
+        case "$p" in /*) ;; *) p="$d/$p" ;; esac
+    done
+    printf '%s/%s\n' "$(cd "$(dirname "$p")" && pwd -P)" "$(basename "$p")"
+}
+
+VIBE_SELF="$(resolve_self "$0")"
+VIBE_HOME="${VIBE_HOME:-$(dirname "$(dirname "$VIBE_SELF")")}"
+export VIBE="$VIBE_SELF"
+export VIBE_HOME
+
+# shellcheck source=../lib/common.sh
+. "$VIBE_HOME/lib/common.sh" || exit 2
+
+die() { echo "vibe: $*" >&2; exit 2; }
+need_arg() { [ "$2" -ge 2 ] || die "option $1 needs a value"; }
+
+usage() {
+    cat <<'EOF'
+vibe — progressive agent-ready setup for any repo
+
+  vibe init [dir] [--stack auto|<name>] [--level 0|1|2|3] [--topology single|monorepo|workspace]
+            [--packages "a b"] [--repos "../x ../y"] [--name <project>] [--dry-run] [--vendor]
+      e.g.  vibe init . --level 3
+  vibe verify [--fast] [--all] [-C dir]
+      e.g.  vibe verify --fast
+  vibe lint [--self-test] [-C dir] [files...]
+      e.g.  vibe lint src/app.py
+  vibe state [-C dir]
+      e.g.  vibe state
+  vibe doctor [-C dir] [--brief]
+      e.g.  vibe doctor
+  vibe log <phase> <decision> <why> <evidence> <result> [--file PATH]
+      e.g.  vibe log fix "retry on 503" "flaky upstream" "test_retry passes" kept
+  vibe help
+EOF
+}
+
+# ───────────────────────────── init ─────────────────────────────
+
+detect_stack() {
+    local d="$1"
+    if [ -f "$d/package.json" ]; then echo node-ts; return; fi
+    if [ -f "$d/pyproject.toml" ] || [ -f "$d/requirements.txt" ] || [ -f "$d/setup.py" ]; then echo python; return; fi
+    if [ -f "$d/go.mod" ]; then echo go; return; fi
+    if [ -f "$d/Cargo.toml" ]; then echo rust; return; fi
+    if [ -f "$d/Package.swift" ] || compgen -G "$d/*.xcodeproj" >/dev/null; then echo swift; return; fi
+    if compgen -G "$d/build.gradle*" >/dev/null || [ -f "$d/pom.xml" ]; then echo jvm; return; fi
+    echo generic
+}
+
+has_stack_marker() {
+    local d="$1"
+    [ -f "$d/package.json" ] || [ -f "$d/go.mod" ] || [ -f "$d/Cargo.toml" ] || [ -f "$d/pyproject.toml" ] \
+        || [ -f "$d/requirements.txt" ] || [ -f "$d/setup.py" ] || [ -f "$d/Package.swift" ] || [ -f "$d/pom.xml" ] \
+        || compgen -G "$d/*.xcodeproj" >/dev/null || compgen -G "$d/build.gradle*" >/dev/null
+}
+
+detect_topology() {
+    local d="$1"
+    if [ -f "$d/pnpm-workspace.yaml" ] || [ -f "$d/lerna.json" ] || [ -f "$d/nx.json" ] || [ -f "$d/turbo.json" ] || [ -f "$d/go.work" ]; then
+        echo monorepo; return
+    fi
+    if [ -f "$d/Cargo.toml" ] && grep -q '^\[workspace\]' "$d/Cargo.toml"; then echo monorepo; return; fi
+    if [ -f "$d/package.json" ] && grep -q '"workspaces"' "$d/package.json"; then echo monorepo; return; fi
+    echo single
+}
+
+default_packages() {
+    local d="$1" g p out=""
+    for g in apps packages services libs; do
+        [ -d "$d/$g" ] || continue
+        for p in "$d/$g"/*/; do
+            [ -d "$p" ] || continue
+            p="${p%/}"
+            if has_stack_marker "$p"; then out="$out $g/$(basename "$p")"; fi
+        done
+    done
+    echo "${out# }"
+}
+
+# copy_file <src> <dst> <display> — never overwrites; substitutes {{PLACEHOLDERS}}
+copy_file() {
+    local src="$1" dst="$2" disp="$3"
+    if [ -e "$dst" ]; then echo "skip $disp (exists)"; return 0; fi
+    [ -f "$src" ] || { echo "warn: missing template $src" >&2; return 0; }
+    echo "create $disp"
+    [ "${DRY:-0}" = 1 ] && return 0
+    mkdir -p "$(dirname "$dst")"
+    perl -pe 's/\{\{(PROJECT_NAME|STACK|TOPOLOGY|PACKAGES|REPOS|DATE)\}\}/defined $ENV{"V_$1"} ? $ENV{"V_$1"} : ""/ge' "$src" > "$dst"
+    if [ -x "$src" ]; then chmod +x "$dst"; fi
+}
+
+# copy_tree <srcdir> <dstdir> <display-prefix>
+copy_tree() {
+    local src="$1" dst="$2" pre="$3" f rel
+    [ -d "$src" ] || return 0
+    (cd "$src" && find . -type f ! -name .DS_Store | sort) | while IFS= read -r f; do
+        rel="${f#./}"
+        copy_file "$src/$rel" "$dst/$rel" "$pre$rel"
+    done
+}
+
+ensure_gitignore() {
+    local dir="$1" line
+    for line in '.vibe/state/' '.claude/settings.local.json' 'CLAUDE.local.md'; do
+        if [ -f "$dir/.gitignore" ] && grep -qxF "$line" "$dir/.gitignore"; then continue; fi
+        echo "append .gitignore: $line"
+        [ "${DRY:-0}" = 1 ] && continue
+        if [ -s "$dir/.gitignore" ] && [ -n "$(tail -c1 "$dir/.gitignore")" ]; then printf '\n' >> "$dir/.gitignore"; fi
+        printf '%s\n' "$line" >> "$dir/.gitignore"
+    done
+}
+
+# lint rules = generic + (stack != generic ? stack : nothing)
+install_lint_rules() {
+    local dst="$1" stack="$2" disp="$3" tmp
+    [ -e "$dst" ] && { echo "skip $disp (exists)"; return 0; }
+    tmp="$(mktemp "${TMPDIR:-/tmp}/vibe-rules.XXXXXX")"
+    cat "$VIBE_HOME/stacks/generic/lint-rules" > "$tmp" 2>/dev/null
+    if [ "$stack" != generic ] && [ -f "$VIBE_HOME/stacks/$stack/lint-rules" ]; then
+        printf '\n' >> "$tmp"
+        cat "$VIBE_HOME/stacks/$stack/lint-rules" >> "$tmp"
+    fi
+    copy_file "$tmp" "$dst" "$disp"
+    rm -f "$tmp"
+}
+
+install_stack_conf() {
+    local dst="$1" stack="$2" disp="$3"
+    if [ ! -f "$VIBE_HOME/stacks/$stack/verify.conf" ]; then echo "warn: stack '$stack' has no verify.conf" >&2; return 0; fi
+    copy_file "$VIBE_HOME/stacks/$stack/verify.conf" "$dst" "$disp"
+}
+
+vendor_install() {
+    local dir="$1" v="$1/.vibe/vendor" f settings tmp
+    echo "vendor: $v"
+    if [ "${DRY:-0}" = 1 ]; then return 0; fi
+    mkdir -p "$v/bin" "$v/lib" "$v/hooks"
+    cp "$VIBE_HOME/bin/vibe" "$v/bin/vibe"
+    cp "$VIBE_HOME"/lib/* "$v/lib/"
+    cp "$VIBE_HOME"/hooks/* "$v/hooks/"
+    chmod +x "$v/bin/vibe" "$v"/hooks/*.sh
+    settings="$dir/.claude/settings.json"
+    if ! command -v jq >/dev/null 2>&1; then echo "warn: jq missing; hooks not registered in .claude/settings.json" >&2; return 0; fi
+    mkdir -p "$dir/.claude"
+    [ -f "$settings" ] || echo '{}' > "$settings"
+    tmp="$(mktemp "${TMPDIR:-/tmp}/vibe-settings.XXXXXX")"
+    if jq --arg base '"$CLAUDE_PROJECT_DIR"/.vibe/vendor/hooks/' '
+        def reg($ev; $m; $s):
+          .hooks[$ev] = (((.hooks[$ev] // []) | map(select(([.hooks[]? | (.command // "")] | any(contains("vendor/hooks/" + $s))) | not)))
+            + [ (if $m == "" then {} else {matcher: $m} end) + {hooks: [{type: "command", command: ($base + $s)}]} ]);
+        (.hooks //= {})
+        | reg("PreToolUse"; "Bash"; "guard-bash.sh")
+        | reg("PostToolUse"; "Edit|Write|MultiEdit"; "lint-edited.sh")
+        | reg("Stop"; ""; "verify-reminder.sh")
+        | reg("SessionStart"; ""; "session-start.sh")' "$settings" > "$tmp"; then
+        mv "$tmp" "$settings"
+        echo "register hooks in .claude/settings.json"
+    else
+        rm -f "$tmp"
+        echo "warn: could not merge hooks into $settings (invalid JSON?)" >&2
+    fi
+}
+
+cmd_init() {
+    local dir="." stack=auto level=1 topo=auto pkgs="" repos="" name="" vendor=0
+    DRY=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --stack) need_arg "$1" "$#"; stack="$2"; shift 2 ;;
+            --level) need_arg "$1" "$#"; level="$2"; shift 2 ;;
+            --topology) need_arg "$1" "$#"; topo="$2"; shift 2 ;;
+            --packages) need_arg "$1" "$#"; pkgs="$2"; shift 2 ;;
+            --repos) need_arg "$1" "$#"; repos="$2"; shift 2 ;;
+            --name) need_arg "$1" "$#"; name="$2"; shift 2 ;;
+            --dry-run) DRY=1; shift ;;
+            --vendor) vendor=1; shift ;;
+            -*) die "init: unknown option $1" ;;
+            *) dir="$1"; shift ;;
+        esac
+    done
+    case "$level" in 0|1|2|3) ;; *) die "init: --level must be 0, 1, 2 or 3" ;; esac
+    case "$topo" in auto|single|monorepo|workspace) ;; *) die "init: --topology must be single, monorepo or workspace" ;; esac
+    export DRY
+    if [ ! -d "$dir" ]; then
+        if [ "$DRY" = 1 ]; then echo "create dir $dir"; else mkdir -p "$dir" || die "cannot create $dir"; fi
+    fi
+    [ -d "$dir" ] && dir="$(vibe_abs_dir "$dir")"
+    [ -n "$name" ] || name="$(basename "$dir")"
+    [ "$topo" = auto ] && topo="$(detect_topology "$dir")"
+
+    export V_PROJECT_NAME="$name" V_TOPOLOGY="$topo" V_DATE="$(date +%Y-%m-%d)" V_PACKAGES="" V_REPOS=""
+    local T="$VIBE_HOME/templates" l p pstack pdir
+
+    if [ "$topo" = workspace ]; then
+        V_STACK="workspace"; export V_STACK
+        V_REPOS="$repos"; export V_REPOS
+        [ -n "$repos" ] || echo "warn: --repos is empty; set REPOS in .vibe/verify.conf" >&2
+        echo "topology: workspace"
+        copy_tree "$T/workspace" "$dir" ""
+        if [ "$DRY" != 1 ] && [ -f "$dir/launch.sh" ]; then chmod +x "$dir/launch.sh"; fi
+        set -f
+        for p in $repos; do
+            if [ -d "$dir/$p" ] && [ ! -d "$dir/$p/.vibe" ]; then
+                echo "repo $p lacks .vibe — run: vibe init \"$dir/$p\" --level $level"
+            elif [ ! -d "$dir/$p" ]; then
+                echo "warn: repo $p not found relative to $dir" >&2
+            fi
+        done
+        set +f
+    elif [ "$topo" = monorepo ]; then
+        V_STACK="monorepo"; export V_STACK
+        [ -n "$pkgs" ] || pkgs="$(default_packages "$dir")"
+        V_PACKAGES="$pkgs"; export V_PACKAGES
+        echo "topology: monorepo"
+        copy_tree "$T/project/L0" "$dir" ""
+        ensure_gitignore "$dir"
+        copy_tree "$T/monorepo/root" "$dir" ""
+        l=1
+        while [ "$l" -le "$level" ]; do copy_tree "$T/project/L$l" "$dir" ""; l=$((l + 1)); done
+        [ "$level" -ge 3 ] && install_lint_rules "$dir/.vibe/lint-rules" generic ".vibe/lint-rules"
+        set -f
+        for p in $pkgs; do
+            pdir="$dir/$p"
+            if [ ! -d "$pdir" ]; then echo "warn: package $p not found" >&2; continue; fi
+            pstack="$stack"
+            [ "$pstack" = auto ] && pstack="$(detect_stack "$pdir")"
+            echo "package $p stack=$pstack"
+            V_STACK="$pstack"; V_PROJECT_NAME="$(basename "$p")"; export V_STACK V_PROJECT_NAME
+            copy_tree "$T/monorepo/package" "$pdir" "$p/"
+            [ "$level" -ge 1 ] && install_stack_conf "$pdir/.vibe/verify.conf" "$pstack" "$p/.vibe/verify.conf"
+            [ "$level" -ge 3 ] && install_lint_rules "$pdir/.vibe/lint-rules" "$pstack" "$p/.vibe/lint-rules"
+        done
+        set +f
+    else
+        [ "$stack" = auto ] && stack="$(detect_stack "$dir")"
+        V_STACK="$stack"; export V_STACK
+        echo "topology: single  stack: $stack"
+        copy_tree "$T/project/L0" "$dir" ""
+        ensure_gitignore "$dir"
+        l=1
+        while [ "$l" -le "$level" ]; do copy_tree "$T/project/L$l" "$dir" ""; l=$((l + 1)); done
+        [ "$level" -ge 1 ] && install_stack_conf "$dir/.vibe/verify.conf" "$stack" ".vibe/verify.conf"
+        [ "$level" -ge 3 ] && install_lint_rules "$dir/.vibe/lint-rules" "$stack" ".vibe/lint-rules"
+    fi
+
+    [ "$vendor" = 1 ] && vendor_install "$dir"
+    echo "next: run 'vibe doctor'"
+}
+
+# ───────────────────────────── verify ─────────────────────────────
+
+run_dir() {
+    local dir="$1" pre="$2" fast="$3" steps name cmd tmp rc=0
+    vibe_load_conf "$dir" || return 1
+    steps="$STEPS"
+    [ "$fast" = 1 ] && steps="$FAST_STEPS"
+    if [ -z "$steps" ]; then echo "${pre}SKIP (no steps)"; return 0; fi
+    for name in $steps; do
+        case "$name" in *[!A-Za-z0-9_]*) echo "${pre}FAIL $name (invalid step name)"; rc=1; continue ;; esac
+        eval "cmd=\${step_$name:-}"
+        if [ -z "$cmd" ] || [ "$cmd" = skip ]; then echo "${pre}SKIP $name"; continue; fi
+        tmp="$(mktemp "${TMPDIR:-/tmp}/vibe-step.XXXXXX")"
+        if (cd "$dir" && bash -c "$cmd") >"$tmp" 2>&1; then
+            echo "${pre}PASS $name"
+        else
+            echo "${pre}FAIL $name"
+            tail -n 40 "$tmp" | sed 's/^/    /'
+            rc=1
+        fi
+        rm -f "$tmp"
+    done
+    if [ "$fast" != 1 ] && [ "$rc" -eq 0 ]; then vibe_write_stamp "$dir"; fi
+    return "$rc"
+}
+
+cmd_verify() {
+    local fast=0 all=0 start="." root t0 failed=0 pkgs repos own r p d
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --fast) fast=1; shift ;;
+            --all) all=1; shift ;;
+            -C) need_arg "$1" "$#"; start="$2"; shift 2 ;;
+            *) die "verify: unknown argument $1" ;;
+        esac
+    done
+    root="$(vibe_find_root verify.conf "$start")" || die "no .vibe/verify.conf found (run 'vibe init')"
+    t0="$(date +%s)"
+    vibe_load_conf "$root"
+    pkgs="$PACKAGES"; repos="$REPOS"; own="$STEPS"
+    set -f
+    if [ -n "$repos" ]; then
+        for r in $repos; do
+            d="$root/$r"
+            if [ -f "$d/.vibe/verify.conf" ]; then
+                d="$(vibe_abs_dir "$d")"
+                run_dir "$d" "[$r] " "$fast" || failed=1
+            else
+                echo "skip [$r] (no .vibe/verify.conf)"
+            fi
+        done
+    elif [ -n "$pkgs" ]; then
+        for p in $pkgs; do
+            if [ ! -f "$root/$p/.vibe/verify.conf" ]; then echo "skip [$p] (no .vibe/verify.conf)"; continue; fi
+            if [ "$all" = 1 ] || vibe_pkg_affected "$root" "$p"; then
+                run_dir "$root/$p" "[$p] " "$fast" || failed=1
+            else
+                echo "skip [$p] (unaffected)"
+            fi
+        done
+    fi
+    set +f
+    if [ -n "$own" ] || { [ -z "$repos" ] && [ -z "$pkgs" ]; }; then
+        run_dir "$root" "" "$fast" || failed=1
+    fi
+    echo "total: $(( $(date +%s) - t0 ))s"
+    [ "$failed" -eq 0 ] || exit 1
+    exit 0
+}
+
+# ───────────────────────────── lint ─────────────────────────────
+
+cmd_lint() {
+    local self_test=0 start="." files=() f root abs list rc
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --self-test) self_test=1; shift ;;
+            -C) need_arg "$1" "$#"; start="$2"; shift 2 ;;
+            --) shift; while [ $# -gt 0 ]; do files+=("$1"); shift; done ;;
+            *) files+=("$1"); shift ;;
+        esac
+    done
+    root="$(vibe_find_root lint-rules "$start")" || exit 0
+    if [ "$self_test" = 1 ]; then
+        perl "$VIBE_HOME/lib/lint.pl" --rules "$root/.vibe/lint-rules" --base "$root" --self-test
+        exit $?
+    fi
+    if [ "${#files[@]}" -gt 0 ]; then
+        local -a abs_files=()
+        for f in "${files[@]}"; do
+            case "$f" in /*) abs="$f" ;; *) abs="$PWD/$f" ;; esac
+            [ -f "$abs" ] || continue
+            abs_files+=("$(vibe_abs_dir "$(dirname "$abs")")/$(basename "$abs")")
+        done
+        [ "${#abs_files[@]}" -gt 0 ] || exit 0
+        perl "$VIBE_HOME/lib/lint.pl" --rules "$root/.vibe/lint-rules" --base "$root" -- "${abs_files[@]}"
+        exit $?
+    fi
+    list="$(mktemp "${TMPDIR:-/tmp}/vibe-lint.XXXXXX")"
+    if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+        git -C "$root" ls-files -co --exclude-standard > "$list" 2>/dev/null
+    else
+        (cd "$root" && find . -type f ! -path './.git/*' | sed 's#^\./##') > "$list"
+    fi
+    perl "$VIBE_HOME/lib/lint.pl" --rules "$root/.vibe/lint-rules" --base "$root" --list "$list"
+    rc=$?
+    rm -f "$list"
+    exit "$rc"
+}
+
+# ───────────────────────────── state ─────────────────────────────
+
+cmd_state() {
+    local start="." root
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -C) need_arg "$1" "$#"; start="$2"; shift 2 ;;
+            *) die "state: unknown argument $1" ;;
+        esac
+    done
+    root="$(vibe_find_root verify.conf "$start")" || die "no .vibe/verify.conf found"
+    vibe_state_hash "$root"
+}
+
+# ───────────────────────────── doctor ─────────────────────────────
+
+cmd_doctor() {
+    local start="." brief=0 dir top out="" lvl=0 next="" l0=1 l1=1 l2=1 l3=1
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --brief) brief=1; shift ;;
+            -C) need_arg "$1" "$#"; start="$2"; shift 2 ;;
+            *) die "doctor: unknown argument $1" ;;
+        esac
+    done
+    dir="$(vibe_abs_dir "$start")" || die "no such directory: $start"
+    if [ ! -d "$dir/.vibe" ] && [ ! -f "$dir/CLAUDE.md" ]; then
+        top="$(vibe_git_top "$dir")"
+        [ -n "$top" ] && dir="$(vibe_abs_dir "$top")"
+    fi
+    chk() { out="$out$1 $2"$'\n'; }
+
+    # L0
+    local lines bytes g missing
+    if [ -f "$dir/CLAUDE.md" ]; then
+        lines="$(wc -l < "$dir/CLAUDE.md" | tr -d ' ')"
+        bytes="$(wc -c < "$dir/CLAUDE.md" | tr -d ' ')"
+        chk "✓" "L0 CLAUDE.md ($lines lines)"
+        [ "$lines" -gt 200 ] && chk "!" "CLAUDE.md is $lines lines (>200): move detail into .claude/rules/"
+        [ "$bytes" -gt 25600 ] && chk "!" "CLAUDE.md is $bytes bytes (>25 KB): trim it"
+    else
+        chk "✗" "L0 CLAUDE.md missing"; l0=0
+    fi
+    missing=""
+    for g in '.vibe/state/' '.claude/settings.local.json' 'CLAUDE.local.md'; do
+        grep -qxF "$g" "$dir/.gitignore" 2>/dev/null || missing="$missing $g"
+    done
+    if [ -z "$missing" ]; then chk "✓" "L0 .gitignore entries"; else chk "✗" "L0 .gitignore missing:$missing"; l0=0; fi
+    if [ -f "$dir/.claude/settings.json" ]; then chk "✓" "L0 .claude/settings.json"; else chk "✗" "L0 .claude/settings.json missing"; l0=0; fi
+
+    # L1
+    local conf_steps=""
+    if [ -f "$dir/.vibe/verify.conf" ]; then
+        conf_steps="$(bash -c '. "$1/.vibe/verify.conf" >/dev/null 2>&1; printf %s "${STEPS:-}${PACKAGES:-}${REPOS:-}"' _ "$dir")"
+    fi
+    if [ -n "$conf_steps" ]; then chk "✓" "L1 .vibe/verify.conf has STEPS"; else chk "✗" "L1 .vibe/verify.conf missing or has no STEPS"; l1=0; fi
+    if [ -f "$dir/.claude/skills/verify/SKILL.md" ]; then chk "✓" "L1 verify skill"; else chk "✗" "L1 .claude/skills/verify/SKILL.md missing"; l1=0; fi
+    local verify_todo=0 nfeat=0 ff
+    if [ -d "$dir/.claude/skills/verify" ] && grep -rq 'TODO' "$dir/.claude/skills/verify" 2>/dev/null; then verify_todo=1; fi
+    for ff in "$dir"/.claude/skills/verify/features/*; do
+        if [ -f "$ff" ] && [ "$(basename "$ff")" != README.md ]; then nfeat=$((nfeat + 1)); fi
+    done
+    if [ -f "$dir/.claude/skills/verify/SKILL.md" ]; then
+        if [ "$verify_todo" = 1 ]; then chk "i" "verify skill still has TODOs (run /vibe-core:create-verification)"; else chk "i" "verify skill has no TODOs"; fi
+        if [ "$nfeat" -ge 1 ]; then chk "i" "verify features: $nfeat"; else chk "i" "verify features: none yet besides README.md"; fi
+    fi
+
+    # L2
+    local rules_ok=0 skills_ok=0 f
+    if [ -d "$dir/.claude/rules" ]; then
+        for f in "$dir"/.claude/rules/*.md; do
+            [ -f "$f" ] && grep -q '^paths:' "$f" && rules_ok=1
+        done
+    fi
+    [ -f "$dir/CLAUDE.md" ] && [ "${lines:-999}" -le 200 ] && rules_ok=1
+    for f in "$dir"/.claude/skills/*/; do [ -d "$f" ] && skills_ok=1; done
+    if [ "$rules_ok" = 1 ]; then chk "✓" "L2 rules (path-scoped rules or CLAUDE.md <= 200 lines)"; else chk "✗" "L2 no path-scoped .claude/rules/*.md and CLAUDE.md too long"; l2=0; fi
+    if [ "$skills_ok" = 1 ]; then chk "✓" "L2 skills dir"; else chk "✗" "L2 .claude/skills/ has no skills"; l2=0; fi
+
+    # L3
+    if [ -f "$dir/.vibe/lint-rules" ]; then
+        if "$VIBE" lint --self-test -C "$dir" >/dev/null 2>&1; then chk "✓" "L3 .vibe/lint-rules (self-test passes)"
+        else chk "✗" "L3 .vibe/lint-rules self-test FAILS (run: vibe lint --self-test)"; l3=0; fi
+    else
+        chk "✗" "L3 .vibe/lint-rules missing"; l3=0
+    fi
+
+    local needs
+    if [ "$l0" != 1 ]; then needs=0
+    elif [ "$l1" != 1 ]; then needs=1
+    elif [ "$l2" != 1 ]; then needs=2
+    elif [ "$l3" != 1 ]; then needs=3
+    else needs=""; fi
+    # level = highest fully passing prefix; 0 also when even L0 is incomplete
+    if [ "$l0" != 1 ] || [ "$l1" != 1 ]; then lvl=0
+    elif [ "$l2" != 1 ]; then lvl=1
+    elif [ "$l3" != 1 ]; then lvl=2
+    else lvl=3; fi
+
+    # freshness + hooks
+    local root fresh="never" hooks="none"
+    root="$(vibe_find_root verify.conf "$dir")" && fresh="$(vibe_freshness "$root")"
+    if grep -q 'vendor/hooks/' "$dir/.claude/settings.json" 2>/dev/null; then hooks=vendored
+    elif [ "$brief" = 0 ] && command -v claude >/dev/null 2>&1 && claude plugin list 2>/dev/null | grep -q vibe-core; then hooks=plugin
+    fi
+
+    if [ -n "$needs" ] && [ "$needs" -le 1 ]; then
+        case "$needs" in
+            0) next="run: vibe init --level 0 (creates CLAUDE.md, .claude/settings.json, .gitignore entries)" ;;
+            1) next="run: vibe init --level 1 (adds .vibe/verify.conf and the verify skill)" ;;
+        esac
+    elif [ "$verify_todo" = 1 ]; then
+        next="run /vibe-core:create-verification (the verify skill still has TODOs)"
+    elif [ -n "$needs" ]; then
+        case "$needs" in
+            2) next="run: vibe init --level 2 (adds .claude/rules and the run-app skill)" ;;
+            3) next="add .vibe/lint-rules (vibe init --level 3) or fix its self-test" ;;
+        esac
+    elif [ "$fresh" != fresh ]; then next="run: vibe verify"
+    elif [ "$hooks" = none ] && [ "$brief" = 0 ]; then next="install the plugin (claude plugin install vibe-core@rh-vibecoding) or run: vibe init --vendor"
+    else next="none - fully set up"
+    fi
+
+    if [ "$brief" = 1 ]; then
+        echo "vibe: level $lvl, verify $fresh, next: $next"
+        return 0
+    fi
+    printf '%s' "$out"
+    if [ "$hooks" = none ]; then echo "✗ hooks not active (plugin not installed, nothing vendored)"; else echo "✓ hooks active ($hooks)"; fi
+    echo "verify: $fresh"
+    echo "level: $lvl"
+    echo "next: $next"
+}
+
+# ───────────────────────────── log ─────────────────────────────
+
+cmd_log() {
+    local file="decisions.tsv" args=() cell out="" first=1
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --file) need_arg "$1" "$#"; file="$2"; shift 2 ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    if [ "${#args[@]}" -ne 5 ]; then
+        echo "usage: vibe log <phase> <decision> <why> <evidence> <result> [--file PATH]" >&2
+        echo "  e.g. vibe log fix \"retry on 503\" \"flaky upstream\" \"test_retry passes\" kept" >&2
+        exit 2
+    fi
+    if [ ! -s "$file" ]; then
+        printf 'ts\tphase\tdecision\twhy\tevidence\tresult\n' >> "$file" || die "cannot write $file"
+    fi
+    out="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    for cell in "${args[@]}"; do
+        cell="$(printf '%s' "$cell" | tr '\t\r\n' '   ')"
+        case "$cell" in [=+@-]*) cell="'$cell" ;; esac
+        out="$out"$'\t'"$cell"
+    done
+    printf '%s\n' "$out" >> "$file"
+}
+
+# ───────────────────────────── main ─────────────────────────────
+
+sub="${1:-help}"
+[ $# -gt 0 ] && shift
+case "$sub" in
+    init) cmd_init "$@" ;;
+    verify) cmd_verify "$@" ;;
+    lint) cmd_lint "$@" ;;
+    state) cmd_state "$@" ;;
+    log) cmd_log "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; exit 2 ;;
+esac

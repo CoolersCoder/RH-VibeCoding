@@ -1,0 +1,32 @@
+
+# ── node / typescript ────────────────────────────────────────────────────────
+
+rule: no-focused-tests
+files: **/*.{test,spec}.{ts,tsx,js,jsx,mjs,cjs} **/__tests__/**/*.{ts,tsx,js,jsx}
+pattern: \b(describe|it|test)\.only\(
+message: focused test silently skips the rest of the suite; remove .only
+bad: it.only("adds", () => {})
+bad: describe.only("cart", () => {})
+ok: it("adds", () => {})
+
+rule: no-debugger
+files: **/*.{ts,tsx,js,jsx,mjs,cjs,vue,svelte}
+pattern: ^\s*debugger\s*;?\s*$
+message: leftover debugger statement; remove it
+bad:   debugger;
+ok: const debuggerEnabled = false
+
+rule: no-ts-ignore
+files: **/*.{ts,tsx}
+pattern: @ts-ignore
+message: use `// @ts-expect-error <why>` so it fails once the error is gone, or fix the type
+bad: // @ts-ignore
+ok: // @ts-expect-error upstream types miss the `signal` option (lib v3)
+
+rule: no-console-log
+files: **/*.{ts,tsx,js,jsx,vue,svelte}
+exclude: **/*.{test,spec}.{ts,tsx,js,jsx} **/__tests__/** scripts/** **/scripts/** **/*.config.{ts,js,mjs,cjs}
+pattern: \bconsole\.log\(
+message: debug console.log left in app code; remove it or use the project's logger
+bad: console.log("user", user)
+ok: logger.info("user loaded", { id: user.id })

@@ -1,0 +1,12 @@
+{
+  "name": "rh-vibecoding",
+  "description": "RH-VibeCoding: a progressive, stack-agnostic agentic-coding framework for Claude Code (single repo, monorepo, multi-repo)",
+  "owner": { "name": "Rui Hu" },
+  "plugins": [
+    {
+      "name": "vibe-core",
+      "source": "./plugin/vibe-core",
+      "description": "Progressive agent-ready setup for any repo: verify loop, lint rules, hooks, skills"
+    }
+  ]
+}

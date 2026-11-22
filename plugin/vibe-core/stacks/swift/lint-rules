@@ -1,0 +1,33 @@
+
+# ── swift ────────────────────────────────────────────────────────────────────
+
+rule: no-force-try
+files: **/*.swift
+exclude: **/*Tests/** **/*Tests.swift
+pattern: \btry!\s
+message: try! crashes on any error; use try with do/catch or propagate with throws
+bad:         let data = try! Data(contentsOf: url)
+ok:         let data = try Data(contentsOf: url)
+
+rule: no-async-closure-property
+files: **/*.swift
+pattern: ^\s*(?:(?:private|fileprivate|internal|public|open)(?:\(set\))?\s+)*(?:let|var)\s+\w+\s*:\s*(?:@\w+\s+)*\(?\([^)]*\)\s*async\b
+message: stored async closure properties have crashed (EXC_BAD_ACCESS) across suspension points; call the async method directly at the call site
+bad:     let provider: (String) async throws -> Int
+bad:     private var loader: @Sendable (URL) async -> Data
+ok:     func load(_ provider: (String) async throws -> Int) async rethrows {}
+
+rule: no-hash-value-persisted
+files: **/*.swift
+pattern: \.hashValue\b
+message: hashValue is randomised per process; use a stable hash (FNV-1a / SHA256) for anything persisted, used as a file name, or shown
+bad:     let key = name.hashValue
+ok:     let key = StableHash.fnv1a(name)
+
+rule: no-print
+files: **/*.swift
+exclude: **/*Tests/** **/*Tests.swift **/Package.swift
+pattern: ^\s*print\(
+message: print in app code; use os.Logger (or a DEBUG-only, prefixed QA log line on purpose with lint:allow)
+bad:         print("value", value)
+ok:         logger.debug("value \(value, privacy: .public)")

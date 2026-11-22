@@ -1,0 +1,38 @@
+# vibe lint rules — {{PROJECT_NAME}}
+# Format: blocks separated by blank lines. Fields: rule, files, exclude, pattern (Perl regex, per line) | max_lines,
+# message (say how to fix), bad:/ok: examples (required; `vibe lint --self-test` proves them).
+# Suppress a single line with:  lint:allow <rule> <reason>
+# Add a rule when the same mistake happened twice (/vibe-core:correct).
+
+# ── universal ────────────────────────────────────────────────────────────────
+
+rule: no-merge-markers
+files: **/*.{ts,tsx,js,jsx,mjs,cjs,py,go,rs,swift,kt,kts,java,rb,php,cs,c,h,cc,cpp,hpp,m,mm,json,yml,yaml,toml,sql,sh,css,scss,html,vue,svelte,xml,gradle}
+exclude: .vibe/**
+pattern: ^(<<<<<<<|>>>>>>>)( |$)
+message: unresolved merge conflict marker; resolve the conflict
+bad: <<<<<<< HEAD
+bad: >>>>>>> feature/x
+ok: x = a << 2
+
+rule: no-private-key
+files: **/*.{ts,tsx,js,jsx,mjs,cjs,py,go,rs,swift,kt,kts,java,rb,php,cs,json,yml,yaml,toml,sh,pem,key,txt,cfg,ini,conf,xml,plist}
+exclude: .vibe/**
+pattern: -----BEGIN ([A-Z]+ )?PRIVATE KEY-----
+message: private key committed; remove it, rotate the key, load it from the environment/secret store
+bad: -----BEGIN RSA PRIVATE KEY-----
+bad: -----BEGIN PRIVATE KEY-----
+ok: -----BEGIN CERTIFICATE-----
+
+rule: no-aws-access-key
+files: **/*.{ts,tsx,js,jsx,mjs,cjs,py,go,rs,swift,kt,kts,java,rb,php,cs,json,yml,yaml,toml,sh,txt,cfg,ini,conf,xml,plist}
+exclude: .vibe/**
+pattern: \bAKIA[0-9A-Z]{16}\b
+message: AWS access key id in source; remove it, rotate it, read credentials from the environment
+bad: aws_key = "AKIAIOSFODNN7EXAMPLE"
+ok: prefix = "AKIA"
+
+rule: file-too-long
+files: **/*.{ts,tsx,js,jsx,mjs,cjs,py,go,rs,swift,kt,kts,java,rb,php,cs,c,cc,cpp,m,mm,vue,svelte}
+max_lines: 1000
+message: file over 1000 lines; split it by responsibility before adding more
